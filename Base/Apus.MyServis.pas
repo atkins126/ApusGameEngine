@@ -59,9 +59,47 @@ interface
   SingleArray=array of single;
   FloatArray=array of double;
   ShortStr=string[31];
+  PointerArray=array of pointer;
+  VariantArray=array of variant;
+
 
   // 8-bit strings encodings
   TTextEncoding=(teUnknown,teANSI,teWin1251,teUTF8);
+
+  // "name = value" string pair
+  TNameValue=record
+   name,value:string;
+   procedure Init(st:string;splitter:string='='); // split and trim
+   function Named(st:string):boolean;
+   function GetInt:integer;
+   function GetFloat:double;
+   function GetDate:TDateTime;
+   function Join(separator:string='='):string; // convert back to "name=value"
+  end;
+
+  // Helper object represents in-memory binary buffer, doesn't own data
+  // Useful to pass arbitrary data instead of pointer:size pair
+  TBuffer=record
+   data:PByte;
+   readPos:PByte;
+   size:integer;
+   constructor Create(sour:pointer;sizeInBytes:integer);
+   class function CreateFrom(sour:pointer;sizeInBytes:integer):TBuffer; overload; static;
+   class function CreateFrom(var sour;sizeInBytes:integer):TBuffer; overload; static;
+   class function CreateFrom(bytes:ByteArray):TBuffer; overload; static;
+   class function CreateFrom(st:String8):TBuffer; overload; static;
+   function Slice(length:integer):TBuffer; overload;
+   function Slice(from,length:integer):TBuffer; overload;
+   function ReadByte:byte;
+   function ReadWord:word;
+   function ReadInt:integer;
+   function ReadUInt:cardinal;
+   procedure Skip(numBytes:integer); // advance read pos by
+   procedure Seek(pos:integer);
+   procedure Read(var dest;numBytes:integer);
+   function BytesLeft:integer; inline;
+   function CurrentPos:integer; inline;
+  end;
 
   // Critical section wrapper: provides better debug info
   PCriticalSection=^TMyCriticalSection;
@@ -155,11 +193,16 @@ interface
  // Returns e.message with exception address and call stack (if available)
  function ExceptionMsg(const e:Exception):string;
  // Raise exception with "Not implemented" message
- procedure NotImplemented(msg:string='');
+ procedure NotImplemented(msg:string=''); inline;
+ procedure NotSupported(msg:string=''); inline;
  // Call Stack as string
  function GetCallStack:string;
  // Returns caller address
  function GetCaller:pointer;
+
+ // OS errors
+ function GetSystemErrorCode:cardinal;
+ function GetSystemError:string;
 
  // Check if there is a parameter in the command line (non case-sensitive)
  function HasParam(name:string):boolean;
@@ -209,10 +252,11 @@ interface
  function MyFileExists(fname:String):boolean; // Cross-platform version
  procedure MakeBakFile(fname:string); // Rename xxx.yyy to xxx.bak, delete old xxx.bak if any
  function IsPathRelative(fname:string):boolean;
- function LoadFileAsString(fname:String):String8; // Load file content into string
- function LoadFileAsBytes(fname:String):ByteArray; // Load file content into byte array
+ function LoadFileAsString(fname:String;numBytes:int64=0;startFrom:int64=0):String8; // Load file content into string
+ function LoadFileAsBytes(fname:String;numBytes:int64=0;startFrom:int64=0):ByteArray; // Load file content into byte array
  procedure SaveFile(fname:string;buf:pointer;size:integer); overload; // rewrite file with given data
  procedure SaveFile(fname:string;buf:ByteArray); overload; // rewrite file with given data
+ procedure SaveFile(fname:string;data:String8); overload;
  procedure ReadFile(fname:string;buf:pointer;posit,size:integer); // Read data block from file
  procedure WriteFile(fname:string;buf:pointer;posit,size:integer); // Write data block to file
  {$IFDEF IOS}
@@ -246,6 +290,7 @@ interface
  // Возвращает объем выделенной памяти
  function GetMemoryAllocated:int64;
 
+ // Misc and debug functions
  function GetEnumNameSafe(typeInfo:pointer;value:integer):string;
 
  // Array functions
@@ -343,7 +388,9 @@ interface
  function LastChar(st:String8):AnsiChar; overload; {$ENDIF}
 
  // Safe string indexing
- function CharAt(st:string;index:integer):char;
+ function CharAt(st:string;index:integer):char; overload;
+ {$IFDEF ADDANSI}
+ function CharAt(st:string8;index:integer):AnsiChar; overload; {$ENDIF}
  function WCharAt(st:WideString;index:integer):WideChar;
 
  // заменяет служебные символы в строке таким образом, чтобы её можно было вставить в HTML
@@ -532,9 +579,9 @@ interface
  function StrToIp(ip:string):cardinal; // Строка в IP-адрес (младший байт - первый)
  function VarToStr(v:TVarRec):UnicodeString;  // Variant -> String
  function VarToAStr(v:TVarRec):String8;
- function ParseInt(st:string):int64; inline; overload; // wrong characters ignored
+ function ParseInt(st:string):int64; overload; // wrong characters ignored
  {$IFDEF ADDANSI}
- function ParseInt(st:String8):int64; inline; overload; {$ENDIF}
+ function ParseInt(st:String8):int64; overload; {$ENDIF}
  function ParseFloat(st:string):double; inline; // always use '.' as separator - replacement for SysUtils version
  function ParseIntList(st:string):IntArray; // '123 4,-12;3/5' -> [1234,-12,3,5]
  function ParseBool(st:string):boolean; overload;
@@ -1274,31 +1321,61 @@ function HexToAStr(v:int64;digits:integer=0):String8;
     raise EConvertError.Create(st+' is not a valid floating point number');
   end;
 
- function ParseInt(st:string):int64; inline; // wrong characters ignored
+ function ParseInt(st:string):int64; //inline; // wrong characters ignored
   var
-   i:integer;
+   i,state:integer;
   begin
    result:=0;
-   for i:=1 to length(st) do
-    if st[i] in ['0'..'9'] then result:=result*10+(byte(st[i])-$30);
-   for i:=1 to length(st) do begin
-    if st[i]='-' then result:=-result;
-    if st[i] in ['0'..'9'] then break;
+   state:=0;
+   i:=1;
+   while i<=length(st) do begin
+    if (st[i]>='0') and (st[i]<='9') then begin state:=1; break; end else
+    if st[i]='-' then begin state:=2; break; end else
+    if st[i]='$' then begin state:=3; break; end;
+    inc(i);
    end;
+   if state=3 then // hex
+    while i<=length(st) do begin
+     if st[i] in ['0'..'9','A'..'F','a'..'f'] then
+      result:=result shl 4+HexCharToInt(AnsiChar(st[i]));
+     inc(i);
+    end
+   else
+    while i<=length(st) do begin
+     if st[i] in ['0'..'9'] then
+      result:=result*10+(ord(st[i])-ord('0'));
+     inc(i);
+    end;
+   if state=2 then result:=-result;
   end;
 
  {$IFDEF ADDANSI}
  function ParseInt(st:String8):int64;  // wrong characters ignored
   var
-   i:integer;
+   i,state:integer;
   begin
-   result:=0;
-   for i:=1 to length(st) do
-    if st[i] in ['0'..'9'] then result:=result*10+(byte(st[i])-$30);
-   for i:=1 to length(st) do begin
-    if st[i]='-' then result:=-result;
-    if st[i] in ['0'..'9'] then break;
+   result:=0; /// TODO: add support for hex, rewrite
+   state:=0;
+   i:=1;
+   while i<=length(st) do begin
+    if (st[i]>='0') and (st[i]<='9') then begin state:=1; break; end else
+    if st[i]='-' then begin state:=2; break; end else
+    if st[i]='$' then begin state:=3; break; end;
+    inc(i);
    end;
+   if state=3 then // hex
+    while i<=length(st) do begin
+     if st[i] in ['0'..'9','A'..'F','a'..'f'] then
+      result:=result shl 4+HexCharToInt(AnsiChar(st[i]));
+     inc(i);
+    end
+   else
+    while i<=length(st) do begin
+     if st[i] in ['0'..'9'] then
+      result:=result*10+(ord(st[i])-ord('0'));
+     inc(i);
+    end;
+   if state=2 then result:=-result;
   end;
  {$ENDIF}
 
@@ -3759,6 +3836,12 @@ function BinToStr;
     else result:=st[index];
   end;
 
+ function CharAt(st:string8;index:integer):AnsiChar;
+  begin
+   if (index<1) or (index>length(st)) then result:=#0
+    else result:=st[index];
+  end;
+
  function WCharAt(st:WideString;index:integer):WideChar;
   begin
    if (index<1) or (index>length(st)) then result:=#0
@@ -4116,6 +4199,12 @@ function BinToStr;
    raise EError.Create('Not implemented: '+msg);
   end;
 
+ procedure NotSupported(msg:string='');
+  begin
+   raise EError.Create('Not supported: '+msg);
+  end;
+
+
  function FindFile;
   var
    sr:TSearchRec;
@@ -4374,87 +4463,107 @@ procedure DumpDir(path:string);
    {$ENDIF}
   end;
 
- function LoadFileAsString(fname:string):String8;
+ function LoadFileAsString(fname:string;numBytes:int64=0;startFrom:int64=0):String8;
   var
    buf:ByteArray;
   begin
-   buf:=LoadFileAsBytes(fname);
+   buf:=LoadFileAsBytes(fname,numBytes,startFrom);
    SetLength(result,length(buf));
    move(buf[0],result[1],length(buf));
   end;
 
- function LoadFileAsBytes(fname:string):ByteArray;
+ function LoadFileAsBytes(fname:string;numBytes:int64=0;startFrom:int64=0):ByteArray;
   var
-    f:file;
+   f:THandle;
+   size:int64;
   begin
+   {$IFDEF ANDROID}
+   result:=AndroidLoadFile(fname,bytes,startFrom);
+   if result<>'' then exit;
+   {$ENDIF}
+   ASSERT(startFrom>=0);
+   f:=FileOpen(fname,fmOpenRead);
+   if f=INVALID_HANDLE_VALUE then
+    raise EError.Create('Can''t open file "%s": %s',[fName,GetSystemError]);
    try
-    {$IFDEF ANDROID}
-    result:=AndroidLoadFile(fname);
-    if result<>'' then exit;
-    {$ENDIF}
-    assignFile(f,fname);
-    reset(f,1);
-    SetLength(result,filesize(f));
-    blockread(f,result[0],filesize(f));
-    closefile(f);
-   except
-    on e:exception do
-     raise EError.Create('Failed to load file '+fname+': '+ExceptionMsg(e));
+    size:=FileSeek(f,0,2);
+    if size<0 then
+     raise EError.Create('Can''t seek file "%s": %s',[fName,GetSystemError]);
+    if startFrom>=size then
+     raise EWarning.Create('Read beyond end of file: '+fName);
+    if numBytes=0 then numBytes:=size; // read whole file
+    if startFrom+numBytes>size then numBytes:=size-startFrom; // read until EOF
+
+    SetLength(result,numBytes);
+    FileSeek(f,startFrom,0);
+    size:=FileRead(f,result[0],numBytes);
+    if size<>numBytes then
+     raise EError.Create('Error reading file: '+fName);
+   finally
+    FileClose(f);
    end;
   end;
 
  procedure ReadFile;
   var
-   f:file;
+   f:THandle;
   begin
-   assignFile(f,fname);
-   reset(f,1);
-   seek(f,posit);
-   blockread(f,buf^,size);
-   closefile(f);
+   f:=FileOpen(fName,fmOpenRead);
+   if f=INVALID_HANDLE_VALUE then
+    raise EError.Create('Can''t open file "%s": %s',[fName,GetSystemError]);
+   try
+    if posit>0 then
+     if FileSeek(f,posit,0)<0 then
+      raise EError.Create('Can''t seek file "%s" to %d: %s',[fName,posit,GetSystemError]);
+    if FileRead(f,buf^,size)<>size then
+     raise EError.Create('Failed to read %d bytes from file "%s"',[size,fName]);
+   finally
+    FileClose(f);
+   end;
   end;
 
- procedure WriteFile;
+ procedure WriteFile(fname:string;buf:pointer;posit,size:integer);
   var
-   f:file;
-   fm:integer;
+   f:THandle;
   begin
-   fm:=filemode;
+   f:=FileOpen(fName,fmOpenWrite);
+   if f=INVALID_HANDLE_VALUE then
+    f:=FileCreate(fName,fmOpenWrite);
+   if f=INVALID_HANDLE_VALUE then
+    raise EError.Create('Can''t create/open file "%s": %s',[fName,GetSystemError]);
    try
-    filemode:=2;
-   assignFile(f,fname);
-   if FileExists(fname) then
-    reset(f,1)
-   else
-    rewrite(f,1);
-   seek(f,posit);
-   blockwrite(f,buf^,size);
-   closefile(f);
+    if FileSeek(f,posit,0)<>posit then
+     raise EError.Create('Seek failed "%s" to %d: %s',[fName,posit,GetSystemError]);
+    if FileWrite(f,buf^,size)<>size then
+     raise EError.Create('Can''t write %d bytes to file "%s": %s',[size,fName,GetSystemError]);
    finally
-    filemode:=fm;
+    FileClose(f);
    end;
   end;
 
  procedure SaveFile(fname:string;buf:pointer;size:integer);
   var
-   f:file;
-   fm:integer;
+   f:THandle;
   begin
-   fm:=filemode;
+   f:=FileCreate(fName,fmOpenWrite);
+   if f=INVALID_HANDLE_VALUE then
+    raise EError.Create('Can''t create file "%s": %s',[fName,GetSystemError]);
    try
-    filemode:=2;
-   assignFile(f,fname);
-   rewrite(f,1);
-   if buf<>nil then blockwrite(f,buf^,size);
-   closefile(f);
+    if FileWrite(f,buf^,size)<>size then
+     raise EError.Create('Can''t write %d bytes to file "%s": %s',[size,fName,GetSystemError]);
    finally
-    filemode:=fm;
+    FileClose(f);
    end;
   end;
 
  procedure SaveFile(fname:string;buf:ByteArray); overload; // rewrite file with given data
   begin
-   if length(buf)>0 then SaveFile(fname,@buf[0],length(buf));
+   SaveFile(fname,@buf[0],length(buf));
+  end;
+
+ procedure SaveFile(fname:string;data:String8); overload;
+  begin
+   SaveFile(fName,@data[1],length(data));
   end;
 
  procedure ShiftArray(const arr;sizeInBytes,shiftValue:integer);
@@ -4613,6 +4722,16 @@ procedure DumpDir(path:string);
    dispose(buffer);
    {$ENDIF}
   end;
+
+function GetSystemErrorCode:cardinal;
+ begin
+  result:=GetLastErrorCode;
+ end;
+
+function GetSystemError:string;
+ begin
+  result:=GetLastErrorDesc;
+ end;
 
 function GetCallStack:string;
 var
@@ -5174,6 +5293,146 @@ end;
 
 var
  v:Int64;
+
+{ TNameValue }
+
+function TNameValue.GetDate: TDateTime;
+ begin
+  result:=ParseDate(value);
+ end;
+
+function TNameValue.GetFloat: double;
+ begin
+  result:=ParseFloat(value);
+ end;
+
+function TNameValue.GetInt: integer;
+ begin
+  result:=ParseInt(value);
+ end;
+
+procedure TNameValue.Init(st, splitter: string);
+ var
+  p:integer;
+ begin
+  p:=pos(splitter,st);
+  if p=0 then begin
+   name:=st; value:='';
+  end else begin
+   name:=copy(st,1,p-1);
+   value:=copy(st,p+length(splitter),length(st));
+  end;
+  name:=name.Trim;
+  value:=value.Trim;
+ end;
+
+function TNameValue.Join(separator: string): string;
+ begin
+  result:=name+separator+value;
+ end;
+
+function TNameValue.Named(st: string): boolean;
+ begin
+  result:=SameText(name,st);
+ end;
+
+{ TBuffer }
+
+constructor TBuffer.Create(sour:pointer; sizeInBytes:integer);
+ begin
+  data:=sour;
+  size:=sizeInBytes;
+  readPos:=sour;
+ end;
+
+class function TBuffer.CreateFrom(sour:pointer; sizeInBytes:integer):TBuffer;
+ begin
+  result.Create(sour,sizeInBytes);
+ end;
+
+class function TBuffer.CreateFrom(var sour; sizeInBytes:integer):TBuffer;
+ begin
+  result.Create(@sour,sizeInBytes);
+ end;
+
+class function TBuffer.CreateFrom(bytes: ByteArray):TBuffer;
+ begin
+  result.Create(@bytes[0],length(bytes));
+ end;
+
+class function TBuffer.CreateFrom(st: String8):TBuffer;
+ begin
+  result.Create(@st[low(st)],length(st));
+ end;
+
+function TBuffer.CurrentPos: integer;
+ begin
+  result:=UIntPtr(readPos)-UIntPtr(data);
+ end;
+
+function TBuffer.BytesLeft: integer;
+ begin
+  result:=(UIntPtr(readPos)+size-UIntPtr(data));
+ end;
+
+procedure TBuffer.Read(var dest; numBytes: integer);
+ begin
+  ASSERT(BytesLeft>=numBytes);
+  move(readPos^,dest,numBytes);
+  inc(readPos,numBytes);
+ end;
+
+function TBuffer.ReadByte: byte;
+ begin
+  ASSERT(BytesLeft>0);
+  result:=readPos^;
+  inc(readPos);
+ end;
+
+function TBuffer.ReadInt: integer;
+ begin
+  ASSERT(BytesLeft>=4);
+  result:=PInteger(readPos)^;
+  inc(readPos,4);
+ end;
+
+function TBuffer.ReadUInt: cardinal;
+ begin
+  ASSERT(BytesLeft>=4);
+  result:=PCardinal(readPos)^;
+  inc(readPos,4);
+ end;
+
+function TBuffer.ReadWord: word;
+ begin
+  ASSERT(BytesLeft>=2);
+  result:=PWord(readPos)^;
+  inc(readPos,2);
+ end;
+
+procedure TBuffer.Seek(pos: integer);
+ begin
+  ASSERT((pos>=0) and (pos<size));
+  readPos:=PByte(UIntPtr(data)+pos);
+ end;
+
+procedure TBuffer.Skip(numBytes: integer);
+ begin
+  ASSERT(BytesLeft>=numBytes);
+  inc(readPos,numBytes);
+ end;
+
+function TBuffer.Slice(from, length: integer): TBuffer;
+ begin
+  ASSERT((from>=0) and (length>=0));
+  ASSERT(from+length<=size);
+  result.Create(pointer(UIntPtr(data)+from),length);
+ end;
+
+function TBuffer.Slice(length: integer): TBuffer;
+ begin
+  result:=Slice(CurrentPos,length);
+ end;
 
 initialization
  SetDecimalSeparator('.');

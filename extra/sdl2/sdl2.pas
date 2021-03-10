@@ -128,7 +128,7 @@ unit sdl2;
 }
 
 {$DEFINE SDL}
-
+{$IFDEF CPUX64} {$DEFINE CPU64} {$ENDIF}
 {$I jedi.inc}
 
 interface
@@ -151,22 +151,14 @@ interface
 const
 
   {$IFDEF WINDOWS}
-   {$IFDEF CPU64}
-    SDL_LibName = 'SDL2_64.dll';
-   {$ELSE}
-    SDL_LibName = 'SDL2_32.dll';
-   {$ENDIF}
+   SDL_LibName = 'SDL2.dll';
   {$ENDIF}
 
   {$IFDEF UNIX}
     {$IFDEF DARWIN}
       SDL_LibName = 'libSDL2.dylib';
     {$ELSE}
-      {$IFDEF FPC}
-        SDL_LibName = {$IFDEF CPU64} 'libSDL2_64.so' {$ELSE} 'libSDL2_32.so' {$ENDIF};
-      {$ELSE}
-        SDL_LibName = 'libSDL2.so.0';
-      {$ENDIF}
+      SDL_LibName = 'libSDL2.so.0';
     {$ENDIF}
   {$ENDIF}
 

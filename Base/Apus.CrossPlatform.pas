@@ -105,6 +105,12 @@ interface
   TRect=types.TRect;
   TPoint=types.TPoint;
 {$ENDIF}
+ const
+  dummyConst = 0;
+{$IF not Declared(INVALID_HANDLE_VALUE)}
+  INVALID_HANDLE_VALUE = THandle(-1);
+{$ENDIF}
+
 
  function GetTickCount:cardinal;
  procedure QueryPerformanceCounter(out value:int64);
@@ -117,7 +123,8 @@ interface
  procedure ChangeThreadPriority(priority:integer); // -2..2 where 0 is Normal
 
  function GetSystemInfo:string;
- function GetLastError:cardinal;
+ function GetLastErrorCode:cardinal;
+ function GetLastErrorDesc:string;
 
  {$IFDEF IOS}
  function NSStrUTF8(st:string):NSString;
@@ -168,6 +175,31 @@ uses
    mfence
  end;
 {$ENDIF}
+
+ function GetLastErrorCode:cardinal;
+  begin
+   {$IF declared(GetLastError)}
+    result:=GetLastError;
+   {$ELSE}
+    {$IF Declared(fpGetErrno)}
+     result:=fpGetErrno;
+    {$ENDIF}
+   {$ENDIF}
+  end;
+
+ function GetLastErrorDesc:string;
+  var
+   code:cardinal;
+  begin
+   code:=GetLastErrorCode;
+   {$IF Declared(SysErrorMessage)}
+    result:=SysErrorMessage(code);
+   {$ELSE}
+    if code=0 then result:='NO ERROR'
+     else result:=Format('CODE %d (%8x)',[code,code]);
+   {$ENDIF}
+  end;
+
 
  {$IFDEF IOS}
  // IOS threads
@@ -475,11 +507,9 @@ end;
   begin
    result:=windows.MoveWindow(window,x,y,w,h,repaint);
   end;
- function GetLastError:cardinal;
-  begin
-   result:=windows.GetLastError;
-  end;
 {$ENDIF}
+
+
 
 // iOS SET ===========================================================
 {$IFDEF IOS}
@@ -592,11 +622,6 @@ function GetSystemInfo:string;
 function LaunchProcess(fname,params:string):boolean;
  begin
   result:=false;
- end;
-
-function GetLastError:cardinal;
- begin
-  result:=0;
  end;
 {$ENDIF}
 
